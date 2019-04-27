@@ -1,0 +1,783 @@
+inta---
+title: "Immun dada2 Raw Clipped Seqs Processing"
+author: "Tri Tran"
+date: "April 3, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+Set up packages needed
+```{r}
+library(dada2); packageVersion("dada2")
+library(reshape2)
+library(phyloseq)
+library(ggplot2); packageVersion("ggplot2")
+library(RColorBrewer)
+library(data.table)
+library(decontam)
+library(magrittr)
+library(DESeq2)
+library(ggbiplot)
+library(dplyr)
+library(Rmisc)
+library(broom)
+library(VennDiagram)
+library(vegan)
+library(gplots)
+source("Z:/data/TriTran/hr02192_AIP-root-microbiome_processed/DenefLab-MicrobeMiseq/R/miseqR.R") #will need to download from Denef Lab website.
+# here: http://deneflab.github.io/MicrobeMiseq/ and unzip into code folder. There is also a copy of this code in the Lab 16S Processing Code folder. 
+```
+
+Set up path to clipped fastq files 
+```{r}
+path <- "Z:/data/TriTran/hr02192_AIP-root-microbiome_processed/primer_clipped" # CHANGE ME to the directory containing the fastq files after unzipping.
+head(list.files(path))
+fnFs <- sort(list.files(path, pattern="_R1_001.clipped.fastq", full.names = TRUE)) #change file extension pattern if needed
+fnRs <- sort(list.files(path, pattern="_R2_001.clipped.fastq", full.names = TRUE))
+```
+
+Plot Sequence Quality
+```{r}
+# Extract sample names, assuming filenames have format: NUMBER_SAMPLENAME_XXX.fastq <- file names must be in this format
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 2)
+plotQualityProfile(fnFs[1:2]) #reads are only ~230 bp long after primer clipping, so will clip off last ten bp (220)
+plotQualityProfile(fnRs[1:2])
+
+```
+
+Filter and trim sequences
+```{r}
+filt_path <- file.path(path, "filtered") # Place filtered files in filtered/ subdirectory
+filtFs <- file.path(filt_path, paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(filt_path, paste0(sample.names, "_R_filt.fastq.gz"))
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(220, 220), #trunclen will remove seqs shorter than provided value
+                     maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE, 
+                     compress=TRUE, multithread=FALSE, matchIDs=TRUE, verbose=TRUE) # On Windows set multithread=FALSE
+head(out)
+colSums(out)
+```
+
+
+Estimate errors
+```{r}
+errF <- learnErrors(filtFs, multithread=FALSE, randomize = T) #keep track of how many steps required for convergence
+plotErrors(errF, nominalQ=TRUE)
+errR <- learnErrors(filtRs, multithread=FALSE, randomize = T)
+plotErrors(errR, nominalQ=TRUE)
+```
+
+Dereplicate (unique) samples
+```{r}
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+```
+
+Create dada object
+```{r}
+dadaFs <- dada(derepFs, err=errF, multithread=FALSE)
+dadaRs <- dada(derepRs, err=errR, multithread=FALSE)
+
+dadaFs[[1]]
+```
+
+Merge read pairs and make seq table
+```{r}
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+# Make sequence table
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab) #gives number of ASVs and samples
+sum(seqtab) #gives total number of seqs
+```
+
+
+Inspect distribution of sequence lengths
+```{r}
+table(nchar(getSequences(seqtab))) 
+seqtab2 <- seqtab[,nchar(colnames(seqtab)) %in% seq(355,400)] #remove seqs that are too long to be correct. Max size =412, but with primers removed, should be closer to 370. This parameter can be adjusted as needed. 
+table(nchar(getSequences(seqtab2)))
+dim(seqtab2) #gives number of ASVs and samples
+sum(seqtab2) #gives total number of seqs
+```
+
+Find and remove chimeras
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab2, method="consensus", multithread=FALSE, verbose=TRUE)
+dim(seqtab.nochim) #number of samples and ASVs after removing chimeras
+sum(seqtab.nochim) #number of seqs after removing chimeras
+sum(seqtab.nochim)/sum(seqtab2) #percent seqs kept after removing chimeras
+```
+
+Assign taxonomy to ASVs
+```{r}
+taxa <- assignTaxonomy(seqtab.nochim, "Z:/data/TriTran/hr02192_AIP-root-microbiome_processed/references/silva_nr_v132_train_set.fa.gz", multithread=FALSE, tryRC=TRUE) #tryRC = try reverse complement. #download the most recent version of the silva database. 
+
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+
+
+Make phyloseq object
+```{r}
+mapfile <- "Z:/data/TriTran/hr02192_AIP-root-microbiome_processed/sample_metadata.csv" #make a csv file with sample metadata. example included in folder. 
+map <- read.csv(mapfile)
+map <- sample_data(map)
+rownames(map) <- map$SampleID
+
+immun <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(map), 
+               tax_table(taxa)) #makes phyloseq object. Contains ASV count table, sample data, and tax info. It is also possible to include a phylogenetic tree if you produce one. 
+
+```
+
+
+Save phyloseq objects and sample files
+```{r}
+#Save dada2/phyloseq objects in case you need them again
+saveRDS(immun, "immun.rds")
+saveRDS(taxa, "taxa.rds")
+saveRDS(map, "map.rds")
+saveRDS(seqtab.nochim, "seqtab.nochim.rds")
+# If you close and re-open R
+immun <- readRDS("immun.rds") #how to read RD files back in
+taxa <- readRDS("taxa.rds") #how to read RD files back in
+map <- readRDS("map.rds") #how to read RD files back in
+seqtab.nochim <- readRDS("seqtab.nochim.rds") #how to read RD files back in
+```
+
+Filter out undesired taxa
+```{r}
+immun16 <- immun %>%
+  subset_taxa(
+    Kingdom == "Bacteria" &
+      Family  != "mitochondria" &
+      Family != "Mitochondria" &
+      Class   != "Chloroplast"
+  ) #filters out mitochondrial and chloroplast reads
+
+immun
+immun16 #filtered out 3054 ASVs
+sum(otu_table(immun16)) #number of seqs remaining
+saveRDS(immun16, "immun16.rds")
+```
+
+
+Next step is to deal with negative control. We want to figure out which ASVs are likely contaminants and filter them out. Will do this with decontam package. 
+
+First step to look at library size vs sample type (control vs sample). 
+```{r}
+#Library size as a function of whether its a negative control or not
+df <- as.data.frame(sample_data(immun16)) # Put sample_data into a ggplot-friendly data.frame. For this step it is important to have a column in your sample data that identifies each sample as a sample or control (negative control)
+df$LibrarySize <- sample_sums(immun16)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=SampleOrControl)) + geom_point()
+```
+
+Then, we use the prevalence method to test for presence of likely contaminants. 
+```{r}
+#prevalence method to identify contaminants
+#Use prevalence method when you have negative control samples and you are using them to determine likely contaminants. 
+immun16.rm0 <- prune_samples(sample_sums(immun16)>=1, immun16) #must remove sample with 0 reads, then code will run. Only necessary if you have a sample with 0 reads. 
+sample_data(immun16.rm0)$is.neg <- sample_data(immun16.rm0)$SampleOrControl == "Control"
+contamdf.prev <- isContaminant(immun16.rm0, method="prevalence", neg="is.neg", threshold=0.1) #threshold can be set differently depending on how stringent you want to be with determining likely contaminants. Read more about threshold by typing ?isContaminant
+table(contamdf.prev$contaminant) # tells how many ASVs were deemed likely contaminants. (TRUE = contaminant ASV)
+head(which(contamdf.prev$contaminant)) #tells you which ASVs are contaminants.
+```
+
+Plotting contaminants based on prevalence in samples vs controls.
+```{r}
+# Make phyloseq object of presence-absence in negative controls
+ps.neg <- prune_samples(sample_data(immun16.rm0)$SampleOrControl == "Control", immun16.rm0)
+ps.neg.presence <- transform_sample_counts(ps.neg, function(abund) 1*(abund>0))
+# Make phyloseq object of presence-absence in true positive samples
+ps.pos <- prune_samples(sample_data(immun16.rm0)$SampleOrControl == "Sample", immun16.rm0)
+ps.pos.presence <- transform_sample_counts(ps.pos, function(abund) 1*(abund>0))
+# Make data.frame of prevalence in positive and negative samples
+df.pres <- data.frame(prevalence.pos=taxa_sums(ps.pos.presence), prevalence.neg=taxa_sums(ps.neg.presence),
+                      contam.prev=contamdf.prev$contaminant)
+ggplot(data=df.pres, aes(x=prevalence.neg, y=prevalence.pos, color=contam.prev)) + geom_point()
+```
+
+Filtering out likely contaminants from phyloseq object
+```{r}
+#Filter identified contaminants out of dataset
+keep <- !contamdf.prev$contaminant
+immun16.free <- prune_taxa(keep, immun16.rm0)
+#how many reads removed?
+sum(otu_table(immun16.rm0)) #before filtering
+sum(otu_table(immun16.free)) #after filtering
+
+immun16.free <- subset_samples(immun16.free, SampleOrControl != "Control") #remove negative controls from data set.
+immun16.free
+```
+
+
+ASV Accuracy with Mock Samples
+```{r}
+unqs.mock <- subset_samples(immun16.free, Compartment == "Mock") #if you have mock samples, label them as "mock" in the compartment column of sample data. Or make a separate column with mocks labeled mock and all others labeled sample.
+#unqs.mock <- merge_samples(unqs.mock, "Compartment")
+unqs.mock <- as.data.frame(otu_table(unqs.mock))
+unqs.mock
+t.unqs.mock <- t(unqs.mock) #transpose
+test <- structure(as.character(t.unqs.mock), names = as.character(colnames(t.unqs.mock)))
+unqs.mock.n <- sort(test[test>0], decreasing=TRUE) # Drop ASVs absent in the Mock
+
+cat("DADA2 inferred", length(unqs.mock.n), "sample sequences present in the Mock community.\n") #tells you how many seqs are present in your mock sample. If you use Zymobiomics mock, there should be 14 if you run this before removing mitochondrial and eukaryotic dna and 10 if you run it after. You might be slightly off with sequencing error.  
+#inferred 13 sample sequences present in the mock community. Should be 10.
+```
+
+Compare to reference sequences and tells you if they match
+```{r}
+path <- "X:/data/TriTran/hr02192_AIP-root-microbiome_processed/references"
+mock.ref <- getSequences(file.path(path, "mockcom.fasta")) #fasta file from Zymobiomics website. Update if new mock community is used. 
+match.ref <- sum(sapply(names(unqs.mock.n), function(x) any(grepl(x, mock.ref))))
+cat("Of those,", sum(match.ref), "were exact matches to the expected reference sequences.\n") #may not find all exact matches if seqs have an error in them
+
+```
+
+Remove mock samples
+```{r}
+immun16.rm <- subset_samples(immun16.free, Compartment != "Mock")
+immun16.free
+immun16.rm
+```
+
+
+
+Now we want to look at taxa that are very low abundance.
+
+```{r}
+#Counting singletons/doubletons
+tdt = data.table(tax_table(immun16.rm),
+                 TotalCounts = taxa_sums(immun16.rm),
+                 OTU = taxa_names(immun16.rm))
+tdt[(TotalCounts <= 1), .N]
+tdt[(TotalCounts <= 2), .N]
+```
+
+Histogram of OTU abundance
+```{r}
+taxa_sum_df <- data.frame(sum = taxa_sums(immun16.rm))
+
+# Histogram of OTU abundance
+ggplot(taxa_sum_df, aes(x = sum)) + 
+  geom_histogram(color = "black", fill = "indianred", binwidth = 50) +
+  ggtitle("Distribution of OTU abundance") + 
+  xlab("Read counts") +
+  #xlim(0,2000) +
+  #ylim(0,1000) +
+  theme(axis.title.y = element_blank())
+
+smin <- min(taxa_sums(immun16.rm))
+smean <- mean(taxa_sums(immun16.rm))
+smax <- max(taxa_sums(immun16.rm))
+
+
+```
+
+Remove taxa not seen more than 2 times in at least 10% of the samples
+```{r}
+immun16.filter = filter_taxa(immun16.rm, function(x) sum(x > 2) > (0.1*length(x)), TRUE) # this should be adjusted based on how big your data set is and how stringent of a filter you want. May also be good to run analysis both with and without filtering to see if it changes your results significantly. 
+immun16.filter
+immun16.rm
+```
+
+
+Next we need to filter out samples with low counts.
+Histogram of sample sizes
+```{r}
+sample_sum_df <- data.frame(sum = sample_sums(immun16.filter))
+
+# Histogram of sample read counts
+ggplot(sample_sum_df, aes(x = sum)) + 
+  geom_histogram(color = "black", fill = "indianred", binwidth = 1000) +
+  ggtitle("Distribution of sample sequencing depth") + 
+  xlab("Read counts") +
+  theme(axis.title.y = element_blank())
+
+smin <- min(sample_sums(immun16.filter))
+smean <- mean(sample_sums(immun16.filter))
+smax <- max(sample_sums(immun16.filter))
+
+smin
+smean
+smax
+```
+
+Getting rid of samples with fewer than your expected lowest threshold (and highest if necessary)
+```{r}
+immun16.trim <- prune_samples(sample_sums(immun16.filter)>=100, immun16.filter) # change to reflect your dataset and how many samples you can afford to lose. You want to balance removing very low counts with keeping as many samples as possible.  
+immun16.trim2 <- prune_samples(sample_sums(immun16.trim)<=30000, immun16.trim)
+immun16.trim2
+sum(otu_table(immun16.trim2))
+
+sample_sum_df2 <- data.frame(sum = sample_sums(immun16.trim2))
+
+# Histogram of sample read counts
+ggplot(sample_sum_df2, aes(x = sum)) + 
+  geom_histogram(color = "black", fill = "indianred", binwidth = 1000) +
+  ggtitle("Distribution of sample sequencing depth") + 
+  xlab("Read counts") +
+  theme(axis.title.y = element_blank())
+```
+Sample min/mean/max after removing low/high count samples
+```{r}
+smin <- min(sample_sums(immun16.trim2))
+smean <- mean(sample_sums(immun16.trim2))
+smax <- max(sample_sums(immun16.trim2))
+
+smin
+smean
+smax
+```
+
+Which samples were removed? (low/high counts)
+```{r}
+all.samples <- as.vector(sample_data(immun16.rm)[[1]])
+nolowhigh.samples <- as.vector(sample_data(immun16.trim2)[[1]])
+
+subs <- all.samples %in% nolowhigh.samples
+subset(all.samples, subset = !subs) #list of samples that were removed due to low/high counts
+
+```
+
+
+Overall Beta Diversity of All Samples Together separated by Compartment (if doing both endosphere and rhizosphere samples)
+```{r}
+# Scale reads to even depth 
+immun16_scale <- immun16.trim2 %>%
+  scale_reads(round = "round") 
+
+# Ordinate
+immun16_pcoa <- ordinate(
+  physeq = immun16_scale, 
+  method = "PCoA", 
+  distance = "bray"
+)
+colourCount = 8
+getPalette = colorRampPalette(brewer.pal(8, "Set1"))
+# Plot 
+plot_ordination(
+  physeq = immun16_scale,
+  ordination = immun16_pcoa,
+  color = "Compartment",
+  axes = 1:2,
+  title = "Bray-Curtis Dissimilarity PCoA") + 
+  scale_color_manual(values = getPalette(colourCount)) +
+  geom_point(aes(color = Compartment), alpha = 0.7, size = 4) +
+  geom_point(colour = "grey90", size = 1.5) 
+
+```
+
+
+Permanova results of overall Bray-Curtis Dissimilarity by compartment
+```{r}
+#Permanova
+set.seed(1)
+
+# Calculate bray curtis distance matrix
+all.bray <- phyloseq::distance(immun16_scale, method = "bray")
+
+# make a data frame from the sample_data
+sampledf <- data.frame(sample_data(immun16_scale))
+
+# Adonis test
+adonis(all.bray ~ Compartment, data = sampledf)
+
+# Homogeneity of dispersion test
+beta <- betadisper(all.bray, sampledf$Compartment)
+permutest(beta)
+```
+
+Alpha Diversity. Code from Denef lab tutorial.
+```{r}
+min_lib <- min(sample_sums(immun16.trim2)) #filtered data
+
+# Initialize matrices to store richness and evenness estimates
+nsamp = nsamples(immun16.trim2)
+trials = 100
+
+richness <- matrix(nrow = nsamp, ncol = trials)
+row.names(richness) <- sample_names(immun16.trim2)
+
+shannon <- matrix(nrow = nsamp, ncol = trials)
+row.names(shannon) <- sample_names(immun16.trim2)
+
+
+for (i in 1:100) {
+  # Subsample
+  r <- rarefy_even_depth(immun16.trim2, sample.size = min_lib, verbose = FALSE, replace = T)
+  
+  # Calculate richness
+  rich <- as.numeric(as.matrix(estimate_richness(r, measures = "Observed")))
+  richness[ ,i] <- rich
+  
+  # calculate shannon diversity
+  shan <- as.numeric(as.matrix(estimate_richness(r, measures = "Shannon")))
+  shannon[ ,i] <- shan
+}
+
+# Create a new dataframe to hold the means and standard deviations of richness estimates
+SampleID <- row.names(richness)
+mean <- apply(richness, 1, mean)
+sd <- apply(richness, 1, sd)
+measure <- rep("Richness", nsamp)
+rich_stats <- data.frame(SampleID, mean, sd, measure)
+
+# Create a new dataframe to hold the means and standard deviations of shannon diversity estimates
+SampleID <- row.names(shannon)
+mean <- apply(shannon, 1, mean)
+sd <- apply(shannon, 1, sd)
+measure <- rep("Shannon Diversity", nsamp)
+shan_stats <- data.frame(SampleID, mean, sd, measure)
+
+#combine richness and evenness into one dataframe
+alpha <- rbind(rich_stats, shan_stats)
+
+#adds sample data
+s <- data.frame(sample_data(immun16.trim2))
+alphadiv <- merge(alpha, s, by = "SampleID") 
+setorder(alphadiv, measure, Gen_com)
+
+```
+
+Plot Alpha Diversity
+```{r}
+colourCount = 8 #set based on number of colors needed
+getPalette = colorRampPalette(brewer.pal(8, "Dark2")) #change color palette as desired. Use display.brewer.all() to see palette options.
+
+#plot alpha diversity
+ggplot(alphadiv, aes(x = Gen_com, y = mean, color = Compartment, group = Gen_com)) +
+  geom_boxplot() +
+  facet_grid(measure ~ ., scale = "free", space = "free_x") +
+  geom_point(aes(fill = Compartment), size = 1, shape = 21, position = position_jitterdodge()) +
+  scale_color_manual(values = getPalette(colourCount)) +
+  scale_fill_manual(values = getPalette(colourCount)) +
+  theme(axis.text.x = element_text(angle = 90), legend.position ="top")
+```
+
+Phylum Level Relative Abundance Stacked BarPlot
+```{r}
+
+phyl <- tax_glom(immun16.trim2, taxrank="Phylum") #agglomerates count table to phylum level. Can change taxrank = to look at whatever level you are interested in.
+trans <- transform_sample_counts(phyl, function(x) {x/sum(x)} ) #calculates relative abundance
+
+PhylOTU <- as.data.frame(otu_table(trans)) #pulls out otu table
+map <- sample_data(trans) #pulls out sample data
+
+phyla <- as.vector(tax_table(phyl)[,2]) #list of phyla
+colnames(PhylOTU) <- phyla #makes the phyla the column names of otu table 
+
+
+##sort by sample ID (so that they are in consecutive order)
+PhylOTU <- PhylOTU[order(rownames(PhylOTU)),]
+
+#combine phyla that contribute less than .5% each on average to a sample
+below005=PhylOTU[,colMeans(PhylOTU)<0.005] #adjust depending on 
+below005.cs=rowSums(below005)
+
+#remove those below005 phyla from the table
+PhylOTU=PhylOTU[,colMeans(PhylOTU)>0.005]
+#add the summary from the <0.005
+PhylOTU=cbind(PhylOTU,below005.cs)
+
+#rename the last row
+colnames(PhylOTU)[ncol(PhylOTU)]="Below_0.005"
+
+#Merge with map file
+phylOTU.merge <- merge(PhylOTU, map, by="row.names")
+
+#Then average each by sample
+phyl.avg <- aggregate(phylOTU.merge[,2:(ncol(PhylOTU)+1)], by=list(phylOTU.merge$Gen_com), mean) #averages value from dif genotype*compartment samples and returns average value per genotype*compartment group
+
+rownames(phyl.avg) <- phyl.avg$Group.1 #rename row names
+colnames(phyl.avg)[[1]] <- "Gen_com" #rename first column
+
+group.data <- read.table(file="X:/data/TriTran/hr02192_AIP-root-microbiome_processed/group_data.txt", sep = "\t", header =T) #add in group data file. Example included in data folder.
+rownames(group.data) <- group.data$Gen_com
+
+phyl.avg <- phyl.avg[,-1]
+
+Phylum <- colnames(phyl.avg)
+Kingdom <- rep("Bacteria", length(Phylum))
+taxT <- cbind(Kingdom, Phylum)
+rownames(taxT) <- Phylum
+par.avg <- phyloseq(otu_table(phyl.avg, taxa_are_rows=FALSE), 
+                  sample_data(group.data), tax_table(taxT))
+
+
+par_phylum <- par.avg %>%
+  psmelt() %>%                                         # Melt to long format
+  arrange(Phylum)                                      # Sort data frame alphabetically by phylum
+
+colourCount = length(unique(par_phylum[[10]]))
+getPalette = colorRampPalette(brewer.pal(9, "Set1"))
+
+ggplot(par_phylum) + 
+  geom_bar(stat = "identity", aes(x = Genotype, y = Abundance, fill = Phylum)) +
+  facet_grid(.~Compartment, scales = "free_x", space ="free_x") +
+  scale_fill_manual(values = getPalette(colourCount)) +
+  theme(axis.title.x = element_blank()) + 
+  guides(fill = guide_legend(reverse = TRUE, keywidth = 1, keyheight = 1)) +
+  ylab("Relative Abundance \n") +
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) +
+  ggtitle("Phylum Composition of Bacterial Communities by Compartment")
+```
+
+
+DESeq2 Differential Abundance
+```{r}
+#remove bulk
+all.nobulk <- subset_samples(immun16.trim2, Compartment != "Bulk")
+#convert to deseq object
+diagdds = phyloseq_to_deseq2(all.nobulk, ~ Gen_com)
+#calculate geometric means - alternate way that ignores NAs and 0s from Paul McMurdie phyloseq tutorial
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+geoMeans = apply(counts(diagdds), 1, gm_mean)
+diagdds = estimateSizeFactors(diagdds, geoMeans = geoMeans)
+
+
+diagdds.otu = DESeq(diagdds, fitType="local") #fit for OTU level
+saveRDS(diagdds.otu, "diagdds.otu.rds")
+```
+
+Pairwise Comparison Example
+```{r}
+#OTU level for NahG/MM endosphere
+RtoE_NahG <- results(diagdds.otu,
+                     contrast=c("Gen_com", "E_NahG", "R_NahG"))
+
+
+RtoE_NahG = RtoE_NahG[order(RtoE_NahG$padj, na.last=NA), ]
+alpha = 0.05
+sigtabRtoE_NahG = RtoE_NahG[(RtoE_NahG$padj < alpha), ]
+sigtabRtoE_NahG = cbind(as(sigtabRtoE_NahG, "data.frame"), as(tax_table(all.nobulk)[rownames(sigtabRtoE_NahG), ], "matrix"))
+write.table(sigtabRtoE_NahG, file ="sigtabRtoE_NahG.txt", sep = "\t", quote = FALSE)
+
+
+RtoE_MM <- results(diagdds.otu,
+                   contrast=c("Gen_com", "E_MM", "R_MM"))
+
+RtoE_MM = RtoE_MM[order(RtoE_MM$padj, na.last=NA), ]
+alpha = 0.05
+sigtabRtoE_MM = RtoE_MM[(RtoE_MM$padj < alpha), ]
+sigtabRtoE_MM = cbind(as(sigtabRtoE_MM, "data.frame"), as(tax_table(all.nobulk)[rownames(sigtabRtoE_MM), ], "matrix"))
+write.table(sigtabRtoE_MM, file ="sigtabRtoE_MM.txt", sep = "\t", quote = FALSE)
+
+
+```
+
+Explore Pairwise Comparisons
+```{r}
+Genotype <- rep("NahG", nrow(sigtabRtoE_NahG))
+sigtabRtoE_NahG <- cbind(sigtabRtoE_NahG, Genotype)
+
+Genotype <- rep("MM", nrow(sigtabRtoE_MM))
+sigtabRtoE_MM <- cbind(sigtabRtoE_MM, Genotype)
+
+sigtab <- rbind(sigtabRtoE_NahG, sigtabRtoE_MM) #combine significance tables
+#Reorder factors
+sigtab$Genotype <- factor(sigtab$Genotype, levels = c("NahG", "MM"))
+#Order by Phylum 
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Family order
+x = tapply(sigtab$log2FoldChange, sigtab$Family, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Family = factor(as.character(sigtab$Family), levels=names(x))
+
+
+colourCount = length(unique(sigtab$Phylum))
+getPalette = colorRampPalette(brewer.pal(8, "Dark2"))
+
+#Plot
+ggplot(sigtab, aes(y=Family, x=log2FoldChange, color=Phylum)) + 
+  facet_grid(. ~ Genotype, scales = "free", space ="free_x") +
+  geom_vline(xintercept = 0.0, color = "gray", size = 0.5) +
+  geom_point(size=3) + 
+  scale_color_manual(values = getPalette(colourCount)) +
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5), legend.position = "right",
+        axis.title.y=element_blank(), axis.text.y = element_text(size =8), legend.text = element_text(size =8))
+
+```
+
+Venn Diagram
+```{r}
+RtoE_NahG.up <- subset(sigtabRtoE_NahG, sigtabRtoE_NahG$log2FoldChange > 0)
+RtoE_NahG.up.list <-rownames(RtoE_NahG.up)
+length(RtoE_NahG.up.list)
+
+RtoE_NahG.down <- subset(sigtabRtoE_NahG, sigtabRtoE_NahG$log2FoldChange < 0)
+RtoE_NahG.down.list <-rownames(RtoE_NahG.down)
+length(RtoE_NahG.down.list)
+
+RtoE_MM.up <- subset(sigtabRtoE_MM, sigtabRtoE_MM$log2FoldChange > 0)
+RtoE_MM.up.list <-rownames(RtoE_MM.up)
+length(RtoE_MM.up.list)
+
+RtoE_MM.down <- subset(sigtabRtoE_MM, sigtabRtoE_MM$log2FoldChange < 0)
+RtoE_MM.down.list <-rownames(RtoE_MM.down)
+length(RtoE_MM.down.list)
+
+
+one <- RtoE_NahG.down.list
+two <- RtoE_MM.down.list
+three <- RtoE_NahG.up.list
+four <- RtoE_MM.up.list
+#draw.quad.venn doesn't play nice with R markdown. Copy into console window and run it to see venn diagram in the plot window.
+venn.plot <- draw.quad.venn(
+  area1 = length(one),
+  area2 = length(two),
+  area3 = length(three),
+  area4 = length(four),
+  n12 = length(intersect(one, two)),
+  n13 = length(intersect(one, three)),
+  n23 = length(intersect(two, three)),
+  n14 = length(intersect(one, four)),
+  n24 = length(intersect(two, four)),
+  n34 = length(intersect(three, four)),
+  n123 = length(Reduce(intersect, list(one, two, three))),
+  n124 = length(Reduce(intersect, list(one, two, four))),
+  n134 = length(Reduce(intersect, list(one, three, four))),
+  n234 = length(Reduce(intersect, list(two, three, four))),
+  n1234 = length(Reduce(intersect, list(one, two, three, four))),
+ category = c(paste("RtoE_NahG Down(total ", length(RtoE_NahG.down.list), ")", sep = ""), 
+               paste("RtoE_MM Down (total ", length(RtoE_MM.down.list), ")", sep = ""), 
+               paste("RtoE_NahG Up (total ", length(RtoE_NahG.up.list), ")", sep = ""), 
+               paste("RtoE_MM Up (total ", length(RtoE_MM.up.list), ")", sep = "")),
+  fill = c("#1B9E77", "#D95F02", "#7570B3", "#E7298A"),
+  lwd = rep(.6, 4), 
+  lty = "solid", 
+  col = "black",
+  fontfamily ="sans",
+  cat.fontfamily = "sans",
+  cex = 1,
+  cat.cex = .8,
+  margin=0.1,
+  #cat.just = list(c(-0.5, 1), c(1, 1), c(0.5, 1)),
+  euler.d = FALSE,
+  scaled =  FALSE
+)
+
+```
+
+Heat Maps - enriched taxa. Not the best example because there are only two enriched taxa, and they are not present in the rhizosphere samples, so they have to be removed in order to do clustering. 
+```{r}
+#Get normalized OTU table
+all.trans <- transform_sample_counts(immun16.trim2, function(x) {x/sum(x)} ) #calculates relative abundance
+
+#Merge with map file
+map <- sample_data(all.trans)
+merge <- merge(otu_table(all.trans), map, by="row.names")
+
+#Then average each by sample
+avg <- aggregate(merge[,2:(dim(otu_table(all.trans))[2]+1)], by=list(merge$Gen_com), mean) #change number depending on number of taxa
+
+rownames(avg) <- avg$Group.1
+colnames(avg)[[1]] <- "Gen_com"
+
+group.data <- read.table(file="group_data.txt", sep = "\t", header =T)
+rownames(group.data) <- group.data$Gen_com
+
+avg <- avg[,-1]
+
+all.comp.up.list <- unique(c(RtoE_NahG.up.list, RtoE_MM.up.list))
+all.comp.down.list <- unique(c(RtoE_NahG.down.list, RtoE_MM.down.list))
+
+up.otu <- avg[,all.comp.up.list]
+
+###HEATMAP with AVG REL AB for enriched ASVs
+mat.up <- up.otu
+mat.up.sub <- mat.up[rowSums(mat.up) != 0,]##remove samples where all values are zero
+
+
+my_palette <- colorRampPalette(c("lightyellow", "red"), space = "rgb")(299)
+
+#with bray-curtis dissimilarity
+data.up.dist <- vegdist(as.matrix(mat.up.sub), method = "bray")
+row.up.clus <- hclust(data.up.dist, "aver")
+data.up.dist.g <- vegdist(as.matrix(t(mat.up.sub)), method = "bray")
+col.up.clus <- hclust(data.up.dist.g, "aver")
+
+colors = c(seq(0,0.03,length=150),seq(0.031,0.25,length=150))
+
+heatmap.2(as.matrix(mat.up.sub), 
+          Rowv = as.dendrogram(row.up.clus), 
+          Colv = as.dendrogram(col.up.clus), 
+          dendrogram = "row",
+          col = my_palette,
+          scale = "none",
+          trace ="none",
+          density.info = "none",
+          symkey= FALSE,
+          key = TRUE,
+          breaks = colors,
+          symbreaks = FALSE,
+         margins = c(4,4),
+         offsetRow = 0,
+         cexRow = 0.75,
+         key.title = NA,
+         keysize = .5,
+         key.par = list(cex=0.5, mar =c(2,1,2,2)),
+         lhei=c(.3,1.5), 
+         lwid=c(2,5),
+         labCol = FALSE)
+
+```
+
+Heat Maps - depleted taxa
+```{r}
+all.comp.down.list <- unique(c(RtoE_NahG.down.list, RtoE_MM.down.list))
+
+down.otu <- avg[,all.comp.down.list]
+
+###HEATMAP with AVG REL AB for enriched ASVs
+mat.down <- down.otu
+mat.down.sub <- mat.down[rowSums(mat.down) != 0,]##remove samples where all values are zero
+
+
+my_palette <- colorRampPalette(c("lightyellow", "red"), space = "rgb")(299)
+
+#with bray-curtis dissimilarity
+data.down.dist <- vegdist(as.matrix(mat.down.sub), method = "bray")
+row.down.clus <- hclust(data.down.dist, "aver")
+data.down.dist.g <- vegdist(as.matrix(t(mat.down.sub)), method = "bray")
+col.down.clus <- hclust(data.down.dist.g, "aver")
+
+colors = c(seq(0,0.03,length=150),seq(0.031,0.25,length=150))
+
+heatmap.2(as.matrix(mat.down.sub), 
+          Rowv = as.dendrogram(row.down.clus), 
+          Colv = as.dendrogram(col.down.clus), 
+          dendrogram = "row",
+          col = my_palette,
+          scale = "none",
+          trace ="none",
+          density.info = "none",
+          symkey= FALSE,
+          key = TRUE,
+          breaks = colors,
+          symbreaks = FALSE,
+         margins = c(4,4),
+         offsetRow = 0,
+         cexRow = 0.75,
+         key.title = NA,
+         keysize = .5,
+         key.par = list(cex=0.5, mar =c(2,1,2,2)),
+         lhei=c(.3,1.5), 
+         lwid=c(2,5),
+         labCol = FALSE)
+
+```
+
